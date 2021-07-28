@@ -206,10 +206,11 @@ static int queue_event(struct backend_seatd *backend, int opcode) {
 	return 0;
 }
 
-static void execute_events(struct backend_seatd *backend) {
+static int execute_events(struct backend_seatd *backend) {
 	struct linked_list list;
 	linked_list_init(&list);
 	linked_list_take(&list, &backend->pending_events);
+	int executed = 0;
 	while (!linked_list_empty(&list)) {
 		struct pending_event *ev = (struct pending_event *)list.next;
 		int opcode = ev->opcode;
@@ -231,7 +232,9 @@ static void execute_events(struct backend_seatd *backend) {
 			log_errorf("Invalid opcode: %d", opcode);
 			abort();
 		}
+		executed++;
 	}
+	return executed;
 }
 
 static int dispatch_pending(struct backend_seatd *backend, int *opcode) {
@@ -257,6 +260,15 @@ static int dispatch_pending(struct backend_seatd *backend, int *opcode) {
 		}
 	}
 	return packets;
+}
+
+static int dispatch_pending_and_execute(struct backend_seatd *backend) {
+	int dispatched = dispatch_pending(backend, NULL);
+	if (dispatched == -1) {
+		return -1;
+	}
+	dispatched += execute_events(backend);
+	return dispatched;
 }
 
 static int poll_connection(struct backend_seatd *backend, int timeout) {
@@ -314,35 +326,41 @@ static int get_fd(struct libseat *base) {
 	return backend->connection.fd;
 }
 
-static int dispatch_background(struct libseat *base, int timeout) {
+static int dispatch_and_execute(struct libseat *base, int timeout) {
 	struct backend_seatd *backend = backend_seatd_from_libseat_backend(base);
 	if (backend->error) {
 		errno = ENOTCONN;
 		return -1;
 	}
 
-	int dispatched = dispatch_pending(backend, NULL);
-	if (dispatched > 0) {
-		// We don't want to block if we dispatched something, as the
-		// caller might be waiting for the result. However, we'd also
-		// like to read anything pending.
-		timeout = 0;
+	int predispatch = dispatch_pending_and_execute(backend);
+	if (predispatch == -1) {
+		return -1;
 	}
+
+	// We don't want to block if we dispatched something, as the
+	// caller might be waiting for the result. However, we'd also
+	// like to read anything pending.
 	int read = 0;
-	if (timeout == 0) {
+	if (predispatch == 0 || timeout == 0) {
 		read = connection_read(&backend->connection);
 	} else {
 		read = poll_connection(backend, timeout);
 	}
-	if (read > 0) {
-		dispatched += dispatch_pending(backend, NULL);
+
+	if (read == 0) {
+		return predispatch;
 	} else if (read == -1 && errno != EAGAIN) {
 		log_errorf("Could not read from connection: %s", strerror(errno));
 		return -1;
 	}
 
-	execute_events(backend);
-	return dispatched;
+	int postdispatch = dispatch_pending_and_execute(backend);
+	if (postdispatch == -1) {
+		return -1;
+	}
+
+	return predispatch + postdispatch;
 }
 
 static struct libseat *_open_seat(struct libseat_seat_listener *listener, void *data, int fd) {
@@ -557,7 +575,7 @@ const struct seat_impl seatd_impl = {
 	.close_device = close_device,
 	.switch_session = switch_session,
 	.get_fd = get_fd,
-	.dispatch = dispatch_background,
+	.dispatch = dispatch_and_execute,
 };
 
 #ifdef BUILTIN_ENABLED
@@ -637,6 +655,6 @@ const struct seat_impl builtin_impl = {
 	.close_device = close_device,
 	.switch_session = switch_session,
 	.get_fd = get_fd,
-	.dispatch = dispatch_background,
+	.dispatch = dispatch_and_execute,
 };
 #endif
