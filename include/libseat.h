@@ -47,15 +47,17 @@ struct libseat_seat_listener {
  * The available backends, if enabled at compile-time, are: seatd, logind and
  * builtin.
  *
- * To use builtin, the process must have CAP_SYS_ADMIN or be root at the time
- * of the call. These privileges can be dropped at any point after the call.
+ * To use builtin, the process must have permission to open and use the seat's
+ * devices at the time of the call. In the case of DRM devices, this includes
+ * permission for drmSetMaster(3). These privileges can be dropped at any
+ * point after the call.
  *
  * The returned pointer must be destroyed with libseat_close_seat.
  *
  * Returns a pointer to an opaque libseat struct on success. Returns NULL and
  * sets errno on error.
  */
-struct libseat *libseat_open_seat(struct libseat_seat_listener *listener, void *userdata);
+struct libseat *libseat_open_seat(const struct libseat_seat_listener *listener, void *userdata);
 
 /*
  * Disables a seat, used in response to a disable_seat event. After disabling

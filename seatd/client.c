@@ -14,6 +14,10 @@
 #include <sys/un.h>
 #endif
 
+#if defined(__NetBSD__)
+#include <sys/un.h>
+#endif
+
 #include "client.h"
 #include "linked_list.h"
 #include "log.h"
@@ -34,6 +38,23 @@ static int get_peer(int fd, pid_t *pid, uid_t *uid, gid_t *gid) {
 	*uid = cred.uid;
 	*gid = cred.gid;
 	return 0;
+#elif defined(__NetBSD__)
+	struct unpcbid cred;
+	socklen_t len = sizeof cred;
+	if (getsockopt(fd, 0, LOCAL_PEEREID, &cred, &len) == -1) {
+		// assume builtin backend
+		if (errno == EINVAL) {
+			*pid = getpid();
+			*uid = getuid();
+			*gid = getgid();
+			return 0;
+		}
+		return -1;
+	}
+	*pid = cred.unp_pid;
+	*uid = cred.unp_euid;
+	*gid = cred.unp_egid;
+	return 0;
 #elif defined(__FreeBSD__)
 	struct xucred cred;
 	socklen_t len = sizeof cred;
@@ -49,7 +70,7 @@ static int get_peer(int fd, pid_t *pid, uid_t *uid, gid_t *gid) {
 	*gid = cred.cr_ngroups > 0 ? cred.cr_groups[0] : (gid_t)-1;
 	return 0;
 #else
-	return -1;
+#error Unsupported platform
 #endif
 }
 
@@ -81,6 +102,13 @@ struct client *client_create(struct server *server, int client_fd) {
 
 void client_destroy(struct client *client) {
 	assert(client);
+
+#ifdef LIBSEAT
+	// The built-in backend version of seatd should terminate once its only
+	// client disconnects.
+	client->server->running = false;
+#endif
+
 	client->server = NULL;
 	if (client->connection.fd != -1) {
 		close(client->connection.fd);
@@ -309,6 +337,20 @@ error:
 	return client_send_error(client, errno);
 }
 
+static int handle_ping(struct client *client) {
+	struct proto_header header = {
+		.opcode = SERVER_PONG,
+		.size = 0,
+	};
+
+	if (connection_put(&client->connection, &header, sizeof header) == -1) {
+		log_errorf("Could not write response: %s", strerror(errno));
+		return -1;
+	}
+
+	return 0;
+}
+
 static int client_handle_opcode(struct client *client, uint16_t opcode, size_t size) {
 	int res = 0;
 	switch (opcode) {
@@ -370,6 +412,14 @@ static int client_handle_opcode(struct client *client, uint16_t opcode, size_t s
 			return -1;
 		}
 		res = handle_disable_seat(client);
+		break;
+	}
+	case CLIENT_PING: {
+		if (size != 0) {
+			log_error("Protocol error: invalid ping message");
+			return -1;
+		}
+		res = handle_ping(client);
 		break;
 	}
 	default:
@@ -439,7 +489,13 @@ int client_handle_connection(int fd, uint32_t mask, void *data) {
 			goto fail;
 		}
 		if (len == 0) {
+// https://man.netbsd.org/poll.2
+// Sockets produce POLLIN rather than POLLHUP when the remote end is closed.
+#if defined(__NetBSD__)
+			log_info("Client disconnected");
+#else
 			log_error("Could not read client connection: zero-length read");
+#endif
 			goto fail;
 		}
 

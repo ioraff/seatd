@@ -13,14 +13,20 @@ seatd - A seat management daemon
 *-h*
 	Show help message and quit.
 
+*-n*
+	FD to notify readiness on. A single newline will be written and the fd
+	closed when seatd is ready to serve requests. This is compatible with
+	s6's notification protocol.
+
 *-u <user>*
 	User to own the seatd socket.
 
 *-g <group>*
 	Group to own the seatd socket.
 
-*-s <path>*
-	Where to create the seatd socket. Defaults to `/run/seatd.sock`.
+*-l <loglevel>*
+	Log-level to use. Must be one of debug, info, error or silent. Defaults
+	to error.
 
 *-v*
 	Show the version number and quit.
@@ -33,21 +39,11 @@ such as displays and input devices in a multi-session, multi-seat environment.
 seatd operates over a UNIX domain socket, with *libseat* providing the
 client-side of the protocol.
 
-# ENVIRONMENT
-
-[[ *VARIABLE*
-:[ *VALUES*
-:< *DESCRIPTION*
-|  SEATD_SOCK
-:  File path
-:  Informs libseat of the socket location, needed if it differs from `/run/seatd.sock`
-|  SEATD_LOGLEVEL
-:  silent, error, info, debug
-:  Sets the seatd log level. Defaults to "error"
+The location of the socket for seatd is set at compile-time.
 
 # SEE ALSO
 
-The libseat library, *<libseat.h>*
+The libseat library, *<libseat.h>*, *seatd-launch*(1)
 
 # AUTHORS
 

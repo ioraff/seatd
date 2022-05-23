@@ -13,6 +13,7 @@ enum seat_device_type {
 	SEAT_DEVICE_TYPE_NORMAL,
 	SEAT_DEVICE_TYPE_EVDEV,
 	SEAT_DEVICE_TYPE_DRM,
+	SEAT_DEVICE_TYPE_WSCONS,
 };
 
 struct seat_device {
@@ -33,7 +34,6 @@ struct seat {
 	struct client *next_client;
 
 	bool vt_bound;
-	int cur_ttyfd;
 	int cur_vt;
 	int session_cnt;
 };

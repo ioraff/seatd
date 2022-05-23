@@ -123,12 +123,18 @@ static int set_nonblock(int fd) {
 
 int server_add_client(struct server *server, int fd) {
 	if (set_nonblock(fd) != 0) {
-		close(fd);
 		log_errorf("Could not prepare new client socket: %s", strerror(errno));
+		close(fd);
 		return -1;
 	}
 
 	struct client *client = client_create(server, fd);
+	if (client == NULL) {
+		log_errorf("Could not create client: %s", strerror(errno));
+		close(fd);
+		return -1;
+	}
+
 	client->event_source =
 		poller_add_fd(&server->poller, fd, EVENT_READABLE, client_handle_connection, client);
 	if (client->event_source == NULL) {
@@ -146,7 +152,7 @@ int server_handle_connection(int fd, uint32_t mask, void *data) {
 	if (mask & (EVENT_ERROR | EVENT_HANGUP)) {
 		shutdown(fd, SHUT_RDWR);
 		server->running = false;
-		log_errorf("Server socket received an error: %s", strerror(errno));
+		log_error("Server socket received an error");
 		return -1;
 	}
 

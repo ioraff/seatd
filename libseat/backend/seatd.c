@@ -33,38 +33,23 @@ struct pending_event {
 struct backend_seatd {
 	struct libseat base;
 	struct connection connection;
-	struct libseat_seat_listener *seat_listener;
+	const struct libseat_seat_listener *seat_listener;
 	void *seat_listener_data;
 	struct linked_list pending_events;
+	bool awaiting_pong;
 	bool error;
 
 	char seat_name[MAX_SEAT_LEN];
 };
-
-static int set_nonblock(int fd) {
-	int flags;
-	if ((flags = fcntl(fd, F_GETFD)) == -1 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == -1) {
-		return -1;
-	}
-	if ((flags = fcntl(fd, F_GETFL)) == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-		return -1;
-	}
-	return 0;
-}
 
 static int seatd_connect(void) {
 	union {
 		struct sockaddr_un unix;
 		struct sockaddr generic;
 	} addr = {{0}};
-	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 	if (fd == -1) {
 		log_errorf("Could not create socket: %s", strerror(errno));
-		return -1;
-	}
-	if (set_nonblock(fd) == -1) {
-		log_errorf("Could not make socket non-blocking: %s", strerror(errno));
-		close(fd);
 		return -1;
 	}
 	const char *path = getenv("SEATD_SOCK");
@@ -243,6 +228,12 @@ static int dispatch_pending(struct backend_seatd *backend, int *opcode) {
 	while (connection_get(&backend->connection, &header, sizeof header) != -1) {
 		packets++;
 		switch (header.opcode) {
+		case SERVER_PONG:
+			// We care about whether or not the answer has been
+			// read from the connection, so handle it here instead
+			// of pushing it to the pending event list.
+			backend->awaiting_pong = false;
+			break;
 		case SERVER_DISABLE_SEAT:
 		case SERVER_ENABLE_SEAT:
 			if (queue_event(backend, header.opcode) == -1) {
@@ -342,7 +333,7 @@ static int dispatch_and_execute(struct libseat *base, int timeout) {
 	// caller might be waiting for the result. However, we'd also
 	// like to read anything pending.
 	int read = 0;
-	if (predispatch == 0 || timeout == 0) {
+	if (predispatch > 0 || timeout == 0) {
 		read = connection_read(&backend->connection);
 	} else {
 		read = poll_connection(backend, timeout);
@@ -363,7 +354,7 @@ static int dispatch_and_execute(struct libseat *base, int timeout) {
 	return predispatch + postdispatch;
 }
 
-static struct libseat *_open_seat(struct libseat_seat_listener *listener, void *data, int fd) {
+static struct libseat *_open_seat(const struct libseat_seat_listener *listener, void *data, int fd) {
 	assert(listener != NULL);
 	assert(listener->enable_seat != NULL && listener->disable_seat != NULL);
 	struct backend_seatd *backend = calloc(1, sizeof(struct backend_seatd));
@@ -411,7 +402,7 @@ alloc_error:
 	return NULL;
 }
 
-static struct libseat *open_seat(struct libseat_seat_listener *listener, void *data) {
+static struct libseat *open_seat(const struct libseat_seat_listener *listener, void *data) {
 	int fd = seatd_connect();
 	if (fd == -1) {
 		return NULL;
@@ -450,6 +441,36 @@ static const char *seat_name(struct libseat *base) {
 	return backend->seat_name;
 }
 
+static int send_ping(struct backend_seatd *backend) {
+	struct proto_header header = {
+		.opcode = CLIENT_PING,
+		.size = 0,
+	};
+	if (conn_put(backend, &header, sizeof header) == -1 || conn_flush(backend) == -1) {
+		return -1;
+	}
+	return 0;
+}
+
+static void check_pending_events(struct backend_seatd *backend) {
+	if (linked_list_empty(&backend->pending_events)) {
+		return;
+	}
+	if (backend->awaiting_pong) {
+		return;
+	}
+
+	// We have events pending execution, so a dispatch is required.
+	// However, we likely already drained our socket, so there will not be
+	// anything to read. Instead, send a ping request to seatd, so that the
+	// user will be woken up by its response.
+	if (send_ping(backend) == -1) {
+		log_errorf("Could not send ping request: %s", strerror(errno));
+		return;
+	}
+	backend->awaiting_pong = true;
+}
+
 static int open_device(struct libseat *base, const char *path, int *fd) {
 	struct backend_seatd *backend = backend_seatd_from_libseat_backend(base);
 	if (backend->error) {
@@ -481,11 +502,11 @@ static int open_device(struct libseat *base, const char *path, int *fd) {
 		goto error;
 	}
 
-	execute_events(backend);
+	check_pending_events(backend);
 	return rmsg.device_id;
 
 error:
-	execute_events(backend);
+	check_pending_events(backend);
 	return -1;
 }
 
@@ -516,11 +537,11 @@ static int close_device(struct libseat *base, int device_id) {
 		goto error;
 	}
 
-	execute_events(backend);
+	check_pending_events(backend);
 	return 0;
 
 error:
-	execute_events(backend);
+	check_pending_events(backend);
 	return -1;
 }
 
@@ -579,29 +600,10 @@ const struct seat_impl seatd_impl = {
 };
 
 #ifdef BUILTIN_ENABLED
-#include <signal.h>
 
-static int set_deathsig(int signal);
-
-#if defined(__linux__)
-#include <sys/prctl.h>
-
-static int set_deathsig(int signal) {
-	return prctl(PR_SET_PDEATHSIG, signal);
-}
-#elif defined(__FreeBSD__)
-#include <sys/procctl.h>
-
-static int set_deathsig(int signal) {
-	return procctl(P_PID, 0, PROC_PDEATHSIG_CTL, &signal);
-}
-#else
-#error Unsupported platform
-#endif
-
-static struct libseat *builtin_open_seat(struct libseat_seat_listener *listener, void *data) {
+static struct libseat *builtin_open_seat(const struct libseat_seat_listener *listener, void *data) {
 	int fds[2];
-	if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == -1) {
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds) == -1) {
 		log_errorf("Could not create socket pair: %s", strerror(errno));
 		return NULL;
 	}
@@ -613,6 +615,7 @@ static struct libseat *builtin_open_seat(struct libseat_seat_listener *listener,
 		close(fds[1]);
 		return NULL;
 	} else if (pid == 0) {
+		close(fds[1]);
 		int fd = fds[0];
 		int res = 0;
 		struct server server = {0};
@@ -627,7 +630,7 @@ static struct libseat *builtin_open_seat(struct libseat_seat_listener *listener,
 			res = 1;
 			goto server_error;
 		}
-		set_deathsig(SIGTERM);
+		log_info("Started embedded seatd");
 		while (server.running) {
 			if (poller_poll(&server.poller) == -1) {
 				log_errorf("Could not poll server socket: %s", strerror(errno));
@@ -639,8 +642,10 @@ static struct libseat *builtin_open_seat(struct libseat_seat_listener *listener,
 		server_finish(&server);
 	error:
 		close(fd);
+		log_info("Stopped embedded seatd");
 		exit(res);
 	} else {
+		close(fds[0]);
 		int fd = fds[1];
 		return _open_seat(listener, data, fd);
 	}
